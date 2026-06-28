@@ -1,16 +1,44 @@
 <div align="center">
 
+<img src="docs/assets/vulos-logo.png" alt="Vulos" width="80" height="80" />
+
 # vulos-deliver
 
-### Deliverability engine for the Vulos platform
+### A research project in self-hosted mail deliverability
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Language: Go](https://img.shields.io/badge/language-Go-00ADD8.svg)
+[![Status: research](https://img.shields.io/badge/status-research-orange.svg)](#status)
 [![Go Reference](https://pkg.go.dev/badge/github.com/vul-os/vulos-deliver.svg)](https://pkg.go.dev/github.com/vul-os/vulos-deliver)
 
 <sub>Part of <strong><a href="https://vulos.org">VulOS</a></strong> — the open, self-hostable web OS &amp; app suite.</sub>
 
 </div>
+
+---
+
+## Status
+
+> **vulos-deliver is a research project — not production-recommended yet.**
+>
+> Running your own mail delivery is genuinely hard. IP warming, sender reputation,
+> feedback loops, blocklist monitoring and per-provider throttling are a constantly
+> moving target that takes real, ongoing operational investment to get right.
+> vulos-deliver is our long-term bet on *owning* that stack — but it is not
+> battle-tested at scale.
+>
+> **For now, we recommend Amazon SES** (or another managed relay) for real sending.
+> Conveniently, that's exactly what vulos-deliver gives you today: its **SES backend**
+> is a clean, multi-tenant wrapper (custom domains, DKIM, identity-cap handling,
+> rate limiting, suppression) behind a swappable `Sender` interface.
+>
+> **Vulos itself runs on SES today** — we do *not* yet use the own-IP delivery path
+> in production. The plan is to migrate to fully self-hosted delivery as the engine
+> matures and our volume justifies owning the IP reputation. Until then, treat the
+> own-IP SMTP backend as **experimental**, and use the SES backend for anything real.
+>
+> Follow along, kick the tyres, and contribute — sovereign mail delivery is a
+> problem worth solving, just not one to rush.
 
 ---
 
