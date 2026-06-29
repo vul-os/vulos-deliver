@@ -9,6 +9,15 @@
 // Change provider.Config.Backend from "ses" to "smtp", point Config.SMTP at
 // your submission endpoint, and restart. No other code changes are required —
 // the Sender interface is identical.
+//
+// # TLS behaviour
+//
+//   - Port 465 (or ImplicitTLS: true): implicit TLS — a TLS handshake is
+//     performed before any SMTP commands are exchanged.
+//   - Port 587 (and others): STARTTLS — the connection starts plaintext and
+//     upgrades via the STARTTLS extension. If the server does not advertise
+//     STARTTLS and credentials are configured, Send returns an error rather
+//     than transmitting credentials in the clear.
 package smtp
 
 import (
@@ -16,6 +25,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/smtp"
 	"time"
 
@@ -30,7 +40,7 @@ type Config struct {
 	// Port is the SMTP port. Common values:
 	//   587 — STARTTLS submission (default)
 	//   465 — implicit TLS (SMTPS)
-	//    25 — plain SMTP (use only on private networks)
+	//    25 — plain SMTP (use only on private networks without credentials)
 	Port int `json:"port" yaml:"port"`
 
 	// Username for SMTP AUTH PLAIN.
@@ -45,6 +55,11 @@ type Config struct {
 
 	// TLSSkipVerify disables TLS certificate verification. Only use in dev/test.
 	TLSSkipVerify bool `json:"tlsSkipVerify,omitempty" yaml:"tlsSkipVerify,omitempty"`
+
+	// ImplicitTLS forces implicit TLS (SMTPS) regardless of port number.
+	// Port 465 enables implicit TLS automatically; set this to true when using
+	// implicit TLS on a non-standard port.
+	ImplicitTLS bool `json:"implicitTLS,omitempty" yaml:"implicitTLS,omitempty"`
 }
 
 // Sender is an SMTP-backed deliver.Sender.
@@ -71,8 +86,11 @@ func New(cfg Config) (*Sender, error) {
 
 // Send implements deliver.Sender.
 //
-// It opens a fresh SMTP connection for each call, upgrades to STARTTLS when
-// the server advertises the extension, authenticates, and sends the message.
+// Connection behaviour:
+//   - Port 465 / ImplicitTLS=true: TLS handshake before any SMTP exchange.
+//   - Other ports: plaintext dial, then STARTTLS upgrade if advertised.
+//     If credentials are configured but the server does not advertise STARTTLS,
+//     Send returns an error rather than transmitting credentials in the clear.
 func (s *Sender) Send(_ context.Context, msg deliver.Message) (deliver.Receipt, error) {
 	// Collect all envelope recipients.
 	var rcpts []string
@@ -96,23 +114,49 @@ func (s *Sender) Send(_ context.Context, msg deliver.Message) (deliver.Receipt, 
 
 	addr := fmt.Sprintf("%s:%d", s.cfg.Host, s.cfg.Port)
 
-	c, err := smtp.Dial(addr)
-	if err != nil {
-		return deliver.Receipt{}, fmt.Errorf("smtp: dial %s: %w", addr, err)
-	}
-	defer c.Close()
-
 	tlsCfg := &tls.Config{
 		ServerName:         s.cfg.Host,
 		InsecureSkipVerify: s.cfg.TLSSkipVerify, //nolint:gosec
 		MinVersion:         tls.VersionTLS12,
 	}
 
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		if err := c.StartTLS(tlsCfg); err != nil {
-			return deliver.Receipt{}, fmt.Errorf("smtp: STARTTLS: %w", err)
+	useImplicitTLS := s.cfg.Port == 465 || s.cfg.ImplicitTLS
+
+	var c *smtp.Client
+	if useImplicitTLS {
+		// Implicit TLS (SMTPS): TLS handshake before any SMTP commands.
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 30 * time.Second}, "tcp", addr, tlsCfg)
+		if err != nil {
+			return deliver.Receipt{}, fmt.Errorf("smtp: implicit TLS dial %s: %w", addr, err)
+		}
+		sc, err := smtp.NewClient(conn, s.cfg.Host)
+		if err != nil {
+			conn.Close() //nolint:errcheck
+			return deliver.Receipt{}, fmt.Errorf("smtp: SMTP client over TLS %s: %w", addr, err)
+		}
+		c = sc
+	} else {
+		// STARTTLS: plaintext dial, upgrade if offered.
+		sc, err := smtp.Dial(addr)
+		if err != nil {
+			return deliver.Receipt{}, fmt.Errorf("smtp: dial %s: %w", addr, err)
+		}
+		c = sc
+
+		if ok, _ := c.Extension("STARTTLS"); ok {
+			if err := c.StartTLS(tlsCfg); err != nil {
+				c.Close() //nolint:errcheck
+				return deliver.Receipt{}, fmt.Errorf("smtp: STARTTLS %s: %w", addr, err)
+			}
+		} else if s.cfg.Username != "" {
+			// H1: Fail closed — refuse to send credentials over a cleartext channel.
+			c.Close() //nolint:errcheck
+			return deliver.Receipt{}, fmt.Errorf("smtp: server %s does not advertise STARTTLS "+
+				"— refusing to transmit AUTH credentials over a cleartext connection; "+
+				"use port 465 (implicit TLS) or a server with STARTTLS", addr)
 		}
 	}
+	defer c.Close() //nolint:errcheck
 
 	if s.cfg.Username != "" {
 		auth := smtp.PlainAuth("", s.cfg.Username, s.cfg.Password, s.cfg.Host)
@@ -136,7 +180,7 @@ func (s *Sender) Send(_ context.Context, msg deliver.Message) (deliver.Receipt, 
 		return deliver.Receipt{}, fmt.Errorf("smtp: DATA: %w", err)
 	}
 	if _, err := bytes.NewReader(msg.MIMEBody).WriteTo(wc); err != nil {
-		wc.Close()
+		wc.Close() //nolint:errcheck
 		return deliver.Receipt{}, fmt.Errorf("smtp: write body: %w", err)
 	}
 	if err := wc.Close(); err != nil {

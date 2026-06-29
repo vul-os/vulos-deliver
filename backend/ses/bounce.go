@@ -8,28 +8,16 @@ package ses
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 )
 
-// --- SNS envelope types ---
+// --- SNS notification payload types ---
 
-// snsEnvelope is the outer SNS notification posted to the endpoint.
-type snsEnvelope struct {
-	Type             string `json:"Type"`
-	MessageID        string `json:"MessageId"`
-	TopicArn         string `json:"TopicArn"`
-	Message          string `json:"Message"`      // JSON-encoded SES notification
-	SubscribeURL     string `json:"SubscribeURL"` // only on SubscriptionConfirmation
-	Token            string `json:"Token"`        // only on SubscriptionConfirmation
-	SignatureVersion string `json:"SignatureVersion"`
-	Signature        string `json:"Signature"`
-	SigningCertURL   string `json:"SigningCertURL"`
-}
-
-// sesNotification is the SES notification decoded from snsEnvelope.Message.
+// sesNotification is the SES notification decoded from SNSEnvelope.Message.
 type sesNotification struct {
 	NotificationType string               `json:"notificationType"`
 	Bounce           *sesBouncePaylod     `json:"bounce,omitempty"`
@@ -69,17 +57,22 @@ type sesMail struct {
 // Mount on any path, then register that URL as the subscription endpoint in
 // your SES configuration set's event destinations (via SNS topic).
 //
+// All incoming SNS messages are verified with VerifySNSMessage (RSA-SHA1,
+// SignatureVersion 1) before any action is taken. SubscribeURL auto-confirm
+// is only performed after signature verification and URL host validation.
+//
 // Production checklist:
 //  1. Enable ConfirmSubscriptions so the handler auto-confirms the SNS topic.
-//  2. Add SNS signature verification (see github.com/aws/aws-sdk-go-v2 SNS
-//     message validation; not included here to avoid coupling the library to
-//     an HTTP middleware stack).
-//  3. Back the SuppressionList with a persistent store (Postgres, Redis) so
+//  2. Back the SuppressionList with a persistent store (Postgres, Redis) so
 //     suppressions survive restarts.
 type BounceWebhookHandler struct {
 	suppression          SuppressionList
 	logger               *slog.Logger
 	confirmSubscriptions bool
+	// verifySNS is the signature-verification function. When nil, VerifySNSMessage
+	// is used. Inject a no-op in unit tests that exercise bounce/complaint logic
+	// without needing real AWS-signed payloads.
+	verifySNS func(SNSEnvelope) error
 }
 
 // NewBounceWebhookHandler creates an http.Handler for SNS bounce/complaint events.
@@ -111,10 +104,25 @@ func (h *BounceWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var env snsEnvelope
+	var env SNSEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
 		h.logger.Error("sns webhook: parse envelope", "err", err)
 		http.Error(w, "bad JSON", http.StatusBadRequest)
+		return
+	}
+
+	// C1: Verify the SNS message signature BEFORE acting on any field.
+	verify := h.verifySNS
+	if verify == nil {
+		verify = VerifySNSMessage
+	}
+	if err := verify(env); err != nil {
+		h.logger.Warn("sns webhook: signature verification failed — rejecting message",
+			"err", err,
+			"type", env.Type,
+			"topic", env.TopicArn,
+		)
+		http.Error(w, fmt.Sprintf("signature verification failed: %v", err), http.StatusForbidden)
 		return
 	}
 
@@ -132,7 +140,7 @@ func (h *BounceWebhookHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-func (h *BounceWebhookHandler) handleSubscriptionConfirmation(w http.ResponseWriter, env snsEnvelope) {
+func (h *BounceWebhookHandler) handleSubscriptionConfirmation(w http.ResponseWriter, env SNSEnvelope) {
 	if !h.confirmSubscriptions {
 		h.logger.Info("sns subscription confirmation received (auto-confirm disabled — visit SubscribeURL manually)",
 			"topic", env.TopicArn,
@@ -142,7 +150,19 @@ func (h *BounceWebhookHandler) handleSubscriptionConfirmation(w http.ResponseWri
 		return
 	}
 
-	// Auto-confirm: GET the SubscribeURL provided by SNS.
+	// C2: Validate SubscribeURL host before fetching it.
+	// Signature has already been verified above, but we still enforce the host
+	// allowlist here as a defence-in-depth measure against URL manipulation.
+	if err := validateSubscribeURL(env.SubscribeURL); err != nil {
+		h.logger.Error("sns webhook: SubscribeURL host is not a trusted SNS endpoint",
+			"subscribeURL", env.SubscribeURL,
+			"err", err,
+		)
+		http.Error(w, "invalid SubscribeURL", http.StatusBadRequest)
+		return
+	}
+
+	// Auto-confirm: GET the verified SubscribeURL.
 	resp, err := http.Get(env.SubscribeURL) //nolint:noctx
 	if err != nil {
 		h.logger.Error("sns webhook: subscription confirmation failed", "err", err)
@@ -154,7 +174,7 @@ func (h *BounceWebhookHandler) handleSubscriptionConfirmation(w http.ResponseWri
 	w.WriteHeader(http.StatusOK)
 }
 
-func (h *BounceWebhookHandler) handleNotification(w http.ResponseWriter, env snsEnvelope) {
+func (h *BounceWebhookHandler) handleNotification(w http.ResponseWriter, env SNSEnvelope) {
 	var notif sesNotification
 	if err := json.Unmarshal([]byte(env.Message), &notif); err != nil {
 		h.logger.Error("sns webhook: parse SES notification", "err", err)

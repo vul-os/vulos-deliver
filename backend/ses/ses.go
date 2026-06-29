@@ -33,9 +33,13 @@ import (
 // tenants to regions by consistent hash or round-robin; each region's
 // IdentityManager tracks its own count independently.
 type RegionConfig struct {
-	Region          string `json:"region"          yaml:"region"`
-	AccessKeyID     string `json:"accessKeyId"     yaml:"accessKeyId"`
-	SecretAccessKey string `json:"secretAccessKey" yaml:"secretAccessKey"`
+	Region      string `json:"region"      yaml:"region"`
+	AccessKeyID string `json:"accessKeyId" yaml:"accessKeyId"`
+	// SecretAccessKey is intentionally excluded from JSON/YAML serialisation to
+	// prevent accidental credential leakage in logs or marshalled config output.
+	// Inject via environment variables (AWS_SECRET_ACCESS_KEY) or a secrets
+	// manager and set this field programmatically.
+	SecretAccessKey string `json:"-" yaml:"-"`
 
 	// WarnThreshold is the identity count at which this region logs a warning.
 	// Defaults to DefaultWarnThreshold (9000) when zero.
@@ -48,9 +52,13 @@ type RegionConfig struct {
 // Multi-region: populate Regions instead; the first entry is primary.
 type Config struct {
 	// --- Single-region shorthand ---
-	Region          string `json:"region"          yaml:"region"`
-	AccessKeyID     string `json:"accessKeyId"     yaml:"accessKeyId"`
-	SecretAccessKey string `json:"secretAccessKey" yaml:"secretAccessKey"`
+	Region      string `json:"region"      yaml:"region"`
+	AccessKeyID string `json:"accessKeyId" yaml:"accessKeyId"`
+	// SecretAccessKey is intentionally excluded from JSON/YAML serialisation to
+	// prevent accidental credential leakage in logs or marshalled config output.
+	// Inject via environment variables (AWS_SECRET_ACCESS_KEY) or a secrets
+	// manager and set this field programmatically.
+	SecretAccessKey string `json:"-" yaml:"-"`
 
 	// --- Multi-region (overrides single-region fields when non-empty) ---
 	// Populate this when region A approaches 10,000 identities.

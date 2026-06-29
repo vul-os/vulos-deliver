@@ -78,13 +78,15 @@ import (
     "github.com/vul-os/vulos-deliver/backend/ses"
 )
 
-// Create a Sender (SES backend)
+// Create a Sender (SES backend).
+// SecretAccessKey is excluded from JSON/YAML serialisation; always set it
+// programmatically from an env var or secrets manager to prevent leakage.
 sender, err := provider.New(provider.Config{
     Backend: "ses",
     SES: ses.Config{
         Region:          "us-east-1",
         AccessKeyID:     os.Getenv("AWS_ACCESS_KEY_ID"),
-        SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"),
+        SecretAccessKey: os.Getenv("AWS_SECRET_ACCESS_KEY"), // not marshalled to JSON/YAML
         SendRate:        14, // sends/second (raise after SES quota increase)
     },
 })
@@ -98,13 +100,15 @@ if s, ok := sender.(*ses.Sender); ok {
     _ = s.DetectSandbox(context.Background())
 }
 
-// Send a message
+// Send a message.
+// MIMEBody must be fully pre-composed and include all headers (Subject,
+// Content-Type, From, To, Date, Message-ID, …). The Subject field on
+// deliver.Message is metadata only and is NOT injected by any backend.
 rec, err := sender.Send(context.Background(), deliver.Message{
     TenantID: "tenant-acme",
     From:     deliver.Address{Name: "Acme Notifications", Email: "noreply@acme.com"},
     To:       []deliver.Address{{Email: "user@example.com"}},
-    Subject:  "Welcome to Acme",
-    MIMEBody: mimeBody, // pre-composed MIME body
+    MIMEBody: mimeBody, // must contain Subject: header and all other headers
 })
 ```
 

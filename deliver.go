@@ -34,18 +34,25 @@ type Message struct {
 	// Used for per-tenant throttling, identity selection, and audit logging.
 	TenantID string
 
-	From    Address
-	To      []Address
-	CC      []Address
-	BCC     []Address
+	From Address
+	To   []Address
+	CC   []Address
+	BCC  []Address
+
+	// Subject is metadata only — it is NOT injected into the message by any
+	// backend. If you want a Subject header in the email, include it in MIMEBody.
+	// This field may be used by callers for logging, routing, or audit purposes.
 	Subject string
 
-	// Headers contains additional MIME headers to inject (e.g. List-Unsubscribe,
-	// X-Mailer, Message-ID). Keys must be canonical header names.
+	// Headers is metadata only — it is NOT injected into the message by any
+	// backend. If you want additional headers in the email, include them in
+	// MIMEBody. This field may be used by callers for logging or audit purposes.
 	Headers map[string][]string
 
-	// MIMEBody is the pre-composed MIME message body. It must include Content-Type
-	// and all relevant headers; the backend writes it verbatim into the DATA phase.
+	// MIMEBody is the pre-composed MIME message body. It must include all
+	// required headers (Subject, Content-Type, From, To, Date, Message-ID, etc.)
+	// as well as the message content. The backend writes it verbatim into the
+	// SMTP DATA phase / SES raw message field.
 	MIMEBody []byte
 
 	// ConfigurationSet is the SES configuration set name (SES backend only).
