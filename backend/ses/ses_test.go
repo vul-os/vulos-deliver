@@ -7,6 +7,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sesv2"
+	"github.com/aws/aws-sdk-go-v2/service/sesv2/types"
 
 	deliver "github.com/vul-os/vulos-deliver"
 )
@@ -106,6 +107,41 @@ func TestSend_PartialSuppression(t *testing.T) {
 	}
 	if sent != 1 || suppressed != 1 {
 		t.Errorf("want 1 sent + 1 suppressed, got sent=%d suppressed=%d", sent, suppressed)
+	}
+}
+
+func TestSend_RequireVerifiedIdentity_Blocks(t *testing.T) {
+	mc := &mockSESClient{
+		GetEmailIdentityFn: func(_ context.Context, _ *sesv2.GetEmailIdentityInput, _ ...func(*sesv2.Options)) (*sesv2.GetEmailIdentityOutput, error) {
+			return &sesv2.GetEmailIdentityOutput{
+				DkimAttributes: &types.DkimAttributes{Status: types.DkimStatusPending},
+			}, nil
+		},
+		SendEmailFn: func(_ context.Context, _ *sesv2.SendEmailInput, _ ...func(*sesv2.Options)) (*sesv2.SendEmailOutput, error) {
+			t.Fatal("SendEmail must not be called for an unverified sender domain")
+			return nil, nil
+		},
+	}
+	s, err := New(Config{Region: "us-east-1", Client: mc, RequireVerifiedIdentity: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	_, err = s.Send(context.Background(), testMsg())
+	if !errors.Is(err, deliver.ErrUnverifiedSender) {
+		t.Fatalf("expected ErrUnverifiedSender, got %v", err)
+	}
+}
+
+func TestSend_RequireVerifiedIdentity_Allows(t *testing.T) {
+	mc := &mockSESClient{} // default GetEmailIdentity returns SUCCESS
+	s, err := New(Config{Region: "us-east-1", Client: mc, RequireVerifiedIdentity: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	if _, err := s.Send(context.Background(), testMsg()); err != nil {
+		t.Fatalf("Send (verified) should succeed, got %v", err)
 	}
 }
 

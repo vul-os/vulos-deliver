@@ -121,3 +121,9 @@ var ErrSuppressed = fmt.Errorf("deliver: all recipients suppressed")
 // non-verified recipient address was supplied.
 var ErrSandboxMode = fmt.Errorf("deliver: SES sandbox mode — only verified addresses can receive mail; " +
 	"request production access at https://console.aws.amazon.com/ses/home#/account")
+
+// ErrUnverifiedSender is returned when RequireVerifiedIdentity is enabled and the
+// From domain is not (yet) DKIM-verified with the backend. Sending is refused to
+// protect the shared sending identity's reputation. The send fails CLOSED.
+var ErrUnverifiedSender = fmt.Errorf("deliver: sender domain is not verified for sending; " +
+	"complete DKIM/SPF verification before sending")

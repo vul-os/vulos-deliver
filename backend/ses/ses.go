@@ -15,6 +15,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -77,8 +78,20 @@ type Config struct {
 	ConfigurationSet string `json:"configurationSet,omitempty" yaml:"configurationSet,omitempty"`
 
 	// Suppression is the suppression list backend. If nil, a new
-	// MemorySuppressionList is allocated (not persistent across restarts).
+	// MemorySuppressionList is allocated — NOT persistent across restarts and NOT
+	// shared between instances. Because all tenants share one SES identity, a
+	// non-persistent suppression list lets hard-bounced/complained addresses be
+	// re-mailed after a restart, driving up the account-wide bounce/complaint rate.
+	// Production deployments MUST inject a durable, shared backend
+	// (e.g. SQLSuppressionList or a store-backed adapter).
 	Suppression SuppressionList `json:"-" yaml:"-"`
+
+	// RequireVerifiedIdentity gates sending: when true, Send refuses to deliver a
+	// message whose From domain is not DKIM-verified (status SUCCESS) in SES. This
+	// fails CLOSED — if verification cannot be confirmed, the send is rejected.
+	// It protects the shared SES identity from a tenant blasting mail from an
+	// unverified domain (no DKIM, SPF unaligned) during the verification window.
+	RequireVerifiedIdentity bool `json:"requireVerifiedIdentity,omitempty" yaml:"requireVerifiedIdentity,omitempty"`
 
 	// Logger is the structured logger. Defaults to slog.Default().
 	Logger *slog.Logger `json:"-" yaml:"-"`
@@ -111,10 +124,11 @@ const defaultSendRate = 14.0
 type Sender struct {
 	cfg         Config
 	client      SESEmailClient
-	identity    *IdentityManager
-	rateLimiter *TokenBucket
-	suppression SuppressionList
-	logger      *slog.Logger
+	identity        *IdentityManager
+	rateLimiter     *TokenBucket
+	suppression     SuppressionList
+	requireVerified bool
+	logger          *slog.Logger
 
 	// sandbox is set by DetectSandbox. true means this account is in SES sandbox.
 	sandbox bool
@@ -133,6 +147,11 @@ func New(cfg Config) (*Sender, error) {
 	suppression := cfg.Suppression
 	if suppression == nil {
 		suppression = NewMemorySuppressionList()
+		logger.Warn("ses: no persistent SuppressionList configured — falling back to in-memory list",
+			"impact", "bounce/complaint suppressions are lost on restart and not shared between instances",
+			"risk", "hard-bounced/complained addresses will be re-mailed over the shared SES identity, raising the account-wide bounce rate",
+			"action", "inject Config.Suppression with a durable, shared backend (e.g. SQLSuppressionList)",
+		)
 	}
 
 	rate := cfg.SendRate
@@ -181,12 +200,13 @@ func New(cfg Config) (*Sender, error) {
 	}
 
 	return &Sender{
-		cfg:         cfg,
-		client:      client,
-		identity:    NewIdentityManager(client, region, warnThreshold, logger),
-		rateLimiter: NewTokenBucket(rate),
-		suppression: suppression,
-		logger:      logger,
+		cfg:             cfg,
+		client:          client,
+		identity:        NewIdentityManager(client, region, warnThreshold, logger),
+		rateLimiter:     NewTokenBucket(rate),
+		suppression:     suppression,
+		requireVerified: cfg.RequireVerifiedIdentity,
+		logger:          logger,
 	}, nil
 }
 
@@ -249,6 +269,23 @@ func (s *Sender) Send(ctx context.Context, msg deliver.Message) (deliver.Receipt
 
 	if len(allowed) == 0 {
 		return rec, deliver.ErrSuppressed
+	}
+
+	// Optional send-gate: refuse to send from an unverified domain. Fails CLOSED —
+	// any inability to confirm verification blocks the send, protecting the shared
+	// SES identity from unauthenticated (no-DKIM, unaligned-SPF) blasts.
+	if s.requireVerified {
+		domain := senderDomain(msg.From.Email)
+		if domain == "" {
+			return deliver.Receipt{}, fmt.Errorf("ses: %w: From address %q has no domain", deliver.ErrUnverifiedSender, msg.From.Email)
+		}
+		verified, err := s.identity.IsVerified(ctx, domain)
+		if err != nil {
+			return deliver.Receipt{}, fmt.Errorf("ses: verify sender %q: %w", domain, err)
+		}
+		if !verified {
+			return deliver.Receipt{}, fmt.Errorf("ses: %w: %s", deliver.ErrUnverifiedSender, domain)
+		}
 	}
 
 	// Respect the SES send-rate limit.
@@ -315,6 +352,16 @@ func (s *Sender) SendBatch(ctx context.Context, msgs []deliver.Message) ([]deliv
 
 // Close implements deliver.Sender. The SES client is stateless; this is a no-op.
 func (s *Sender) Close() error { return nil }
+
+// senderDomain extracts the lowercased domain part of an email address, or ""
+// when the address has no "@".
+func senderDomain(email string) string {
+	at := strings.LastIndex(email, "@")
+	if at < 0 || at == len(email)-1 {
+		return ""
+	}
+	return strings.ToLower(email[at+1:])
+}
 
 // filterSuppressed partitions addresses into allowed and suppressed.
 func (s *Sender) filterSuppressed(addrs []deliver.Address) (allowed []deliver.Address, suppressedEmails []string, err error) {
