@@ -3,6 +3,7 @@ package ses
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -107,6 +108,157 @@ func TestSend_PartialSuppression(t *testing.T) {
 	}
 	if sent != 1 || suppressed != 1 {
 		t.Errorf("want 1 sent + 1 suppressed, got sent=%d suppressed=%d", sent, suppressed)
+	}
+}
+
+func TestSend_CcBccInDestination(t *testing.T) {
+	var gotInput *sesv2.SendEmailInput
+	mc := &mockSESClient{
+		SendEmailFn: func(_ context.Context, in *sesv2.SendEmailInput, _ ...func(*sesv2.Options)) (*sesv2.SendEmailOutput, error) {
+			gotInput = in
+			return &sesv2.SendEmailOutput{MessageId: aws.String("ccbcc")}, nil
+		},
+	}
+	s := newTestSender(t, mc)
+
+	msg := testMsg()
+	msg.CC = []deliver.Address{{Email: "cc1@example.com"}, {Email: "cc2@example.com"}}
+	msg.BCC = []deliver.Address{{Email: "bcc1@example.com"}}
+
+	rec, err := s.Send(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotInput == nil || gotInput.Destination == nil {
+		t.Fatal("no Destination captured")
+	}
+	if got := gotInput.Destination.ToAddresses; len(got) != 1 || got[0] != "user@example.com" {
+		t.Errorf("ToAddresses = %v, want [user@example.com]", got)
+	}
+	if got := gotInput.Destination.CcAddresses; len(got) != 2 || got[0] != "cc1@example.com" || got[1] != "cc2@example.com" {
+		t.Errorf("CcAddresses = %v, want [cc1@example.com cc2@example.com]", got)
+	}
+	if got := gotInput.Destination.BccAddresses; len(got) != 1 || got[0] != "bcc1@example.com" {
+		t.Errorf("BccAddresses = %v, want [bcc1@example.com]", got)
+	}
+
+	// Every allowed recipient across To/Cc/Bcc should be marked sent.
+	var sent int
+	for _, r := range rec.Recipients {
+		if r.Status == deliver.StateSent {
+			sent++
+		}
+	}
+	if sent != 4 {
+		t.Errorf("want 4 sent recipients, got %d (%+v)", sent, rec.Recipients)
+	}
+}
+
+func TestSend_SuppressedCcBccFiltered(t *testing.T) {
+	var gotInput *sesv2.SendEmailInput
+	mc := &mockSESClient{
+		SendEmailFn: func(_ context.Context, in *sesv2.SendEmailInput, _ ...func(*sesv2.Options)) (*sesv2.SendEmailOutput, error) {
+			gotInput = in
+			return &sesv2.SendEmailOutput{MessageId: aws.String("supp")}, nil
+		},
+	}
+	s := newTestSender(t, mc)
+
+	_ = s.suppression.Add("cc-bad@example.com", ReasonComplaint)
+	_ = s.suppression.Add("bcc-bad@example.com", ReasonBounce)
+
+	msg := testMsg()
+	msg.CC = []deliver.Address{{Email: "cc-bad@example.com"}, {Email: "cc-ok@example.com"}}
+	msg.BCC = []deliver.Address{{Email: "bcc-bad@example.com"}}
+
+	rec, err := s.Send(context.Background(), msg)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotInput == nil {
+		t.Fatal("no Destination captured")
+	}
+	// Suppressed Cc removed; the good one remains.
+	if got := gotInput.Destination.CcAddresses; len(got) != 1 || got[0] != "cc-ok@example.com" {
+		t.Errorf("CcAddresses = %v, want [cc-ok@example.com]", got)
+	}
+	// The only Bcc was suppressed → BccAddresses must be empty.
+	if got := gotInput.Destination.BccAddresses; len(got) != 0 {
+		t.Errorf("BccAddresses = %v, want empty", got)
+	}
+
+	var suppressed int
+	for _, r := range rec.Recipients {
+		if r.Status == deliver.StateSuppressed {
+			suppressed++
+		}
+	}
+	if suppressed != 2 {
+		t.Errorf("want 2 suppressed, got %d (%+v)", suppressed, rec.Recipients)
+	}
+}
+
+func TestSend_AllSuppressedAcrossSets(t *testing.T) {
+	mc := &mockSESClient{
+		SendEmailFn: func(_ context.Context, _ *sesv2.SendEmailInput, _ ...func(*sesv2.Options)) (*sesv2.SendEmailOutput, error) {
+			t.Fatal("SendEmail must not be called when every recipient is suppressed")
+			return nil, nil
+		},
+	}
+	s := newTestSender(t, mc)
+
+	_ = s.suppression.Add("user@example.com", ReasonBounce)
+	_ = s.suppression.Add("cc@example.com", ReasonBounce)
+	_ = s.suppression.Add("bcc@example.com", ReasonBounce)
+
+	msg := testMsg()
+	msg.CC = []deliver.Address{{Email: "cc@example.com"}}
+	msg.BCC = []deliver.Address{{Email: "bcc@example.com"}}
+
+	rec, err := s.Send(context.Background(), msg)
+	if !errors.Is(err, deliver.ErrSuppressed) {
+		t.Fatalf("expected ErrSuppressed, got %v", err)
+	}
+	var suppressed int
+	for _, r := range rec.Recipients {
+		if r.Status == deliver.StateSuppressed {
+			suppressed++
+		}
+	}
+	if suppressed != 3 {
+		t.Errorf("want 3 suppressed, got %d (%+v)", suppressed, rec.Recipients)
+	}
+}
+
+// TestSend_NoBccHeaderLeak confirms the library does not inject a Bcc header into
+// the rendered message. Bcc recipients are carried only in the SES Destination
+// envelope (BccAddresses); the MIMEBody is delivered verbatim, so blind-copy
+// semantics depend solely on the caller not supplying a Bcc header.
+func TestSend_NoBccHeaderLeak(t *testing.T) {
+	var gotInput *sesv2.SendEmailInput
+	mc := &mockSESClient{
+		SendEmailFn: func(_ context.Context, in *sesv2.SendEmailInput, _ ...func(*sesv2.Options)) (*sesv2.SendEmailOutput, error) {
+			gotInput = in
+			return &sesv2.SendEmailOutput{MessageId: aws.String("leak")}, nil
+		},
+	}
+	s := newTestSender(t, mc)
+
+	msg := testMsg()
+	msg.BCC = []deliver.Address{{Email: "secret@example.com"}}
+
+	if _, err := s.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if gotInput == nil || gotInput.Content == nil || gotInput.Content.Raw == nil {
+		t.Fatal("no raw content captured")
+	}
+	raw := strings.ToLower(string(gotInput.Content.Raw.Data))
+	if strings.Contains(raw, "bcc:") {
+		t.Errorf("rendered MIME leaked a Bcc header: %q", string(gotInput.Content.Raw.Data))
+	}
+	if strings.Contains(raw, "secret@example.com") {
+		t.Errorf("rendered MIME leaked the Bcc recipient address")
 	}
 }
 

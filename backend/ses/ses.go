@@ -251,7 +251,18 @@ func (s *Sender) Suppression() SuppressionList { return s.suppression }
 
 // Send implements deliver.Sender.
 func (s *Sender) Send(ctx context.Context, msg deliver.Message) (deliver.Receipt, error) {
-	allowed, suppressed, err := s.filterSuppressed(msg.To)
+	// Apply the suppression filter to every address set independently. SES uses
+	// Destination as the SMTP envelope, so a suppressed Cc/Bcc address would
+	// otherwise still be mailed.
+	allowedTo, suppressedTo, err := s.filterSuppressed(msg.To)
+	if err != nil {
+		return deliver.Receipt{}, err
+	}
+	allowedCC, suppressedCC, err := s.filterSuppressed(msg.CC)
+	if err != nil {
+		return deliver.Receipt{}, err
+	}
+	allowedBCC, suppressedBCC, err := s.filterSuppressed(msg.BCC)
 	if err != nil {
 		return deliver.Receipt{}, err
 	}
@@ -260,14 +271,27 @@ func (s *Sender) Send(ctx context.Context, msg deliver.Message) (deliver.Receipt
 		Backend: "ses",
 		SentAt:  time.Now(),
 	}
-	for _, a := range suppressed {
+	for _, a := range suppressedTo {
+		rec.Recipients = append(rec.Recipients, deliver.RecipientStatus{
+			Email:  a,
+			Status: deliver.StateSuppressed,
+		})
+	}
+	for _, a := range suppressedCC {
+		rec.Recipients = append(rec.Recipients, deliver.RecipientStatus{
+			Email:  a,
+			Status: deliver.StateSuppressed,
+		})
+	}
+	for _, a := range suppressedBCC {
 		rec.Recipients = append(rec.Recipients, deliver.RecipientStatus{
 			Email:  a,
 			Status: deliver.StateSuppressed,
 		})
 	}
 
-	if len(allowed) == 0 {
+	// If every destination (To + Cc + Bcc) was suppressed, the message is a no-op.
+	if len(allowedTo)+len(allowedCC)+len(allowedBCC) == 0 {
 		return rec, deliver.ErrSuppressed
 	}
 
@@ -293,16 +317,25 @@ func (s *Sender) Send(ctx context.Context, msg deliver.Message) (deliver.Receipt
 		return deliver.Receipt{}, fmt.Errorf("ses: rate limiter: %w", err)
 	}
 
-	toAddrs := make([]string, len(allowed))
-	for i, a := range allowed {
-		toAddrs[i] = a.Email
+	// Build the SES Destination (the SMTP envelope) from all three address sets.
+	// BccAddresses are delivered to but NOT written into the rendered headers by
+	// SES, so blind-copy semantics hold — provided the caller's raw MIME does not
+	// itself contain a Bcc header. This library never composes MIME (MIMEBody is
+	// caller-supplied and sent verbatim), so it adds no Bcc header of its own.
+	dest := &types.Destination{}
+	if len(allowedTo) > 0 {
+		dest.ToAddresses = addrEmails(allowedTo)
+	}
+	if len(allowedCC) > 0 {
+		dest.CcAddresses = addrEmails(allowedCC)
+	}
+	if len(allowedBCC) > 0 {
+		dest.BccAddresses = addrEmails(allowedBCC)
 	}
 
 	input := &sesv2.SendEmailInput{
 		FromEmailAddress: aws.String(msg.From.String()),
-		Destination: &types.Destination{
-			ToAddresses: toAddrs,
-		},
+		Destination:      dest,
 		Content: &types.EmailContent{
 			Raw: &types.RawMessage{
 				Data: msg.MIMEBody,
@@ -325,14 +358,25 @@ func (s *Sender) Send(ctx context.Context, msg deliver.Message) (deliver.Receipt
 	if out.MessageId != nil {
 		rec.MessageID = *out.MessageId
 	}
-	for _, a := range allowed {
-		rec.Recipients = append(rec.Recipients, deliver.RecipientStatus{
-			Email:  a.Email,
-			Status: deliver.StateSent,
-		})
+	for _, set := range [][]deliver.Address{allowedTo, allowedCC, allowedBCC} {
+		for _, a := range set {
+			rec.Recipients = append(rec.Recipients, deliver.RecipientStatus{
+				Email:  a.Email,
+				Status: deliver.StateSent,
+			})
+		}
 	}
 
 	return rec, nil
+}
+
+// addrEmails extracts the email strings from a slice of addresses.
+func addrEmails(addrs []deliver.Address) []string {
+	out := make([]string, len(addrs))
+	for i, a := range addrs {
+		out[i] = a.Email
+	}
+	return out
 }
 
 // SendBatch implements deliver.Sender. Each message is sent independently;
