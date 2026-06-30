@@ -51,7 +51,20 @@ type DomainSetupResult struct {
 	SPFRecord DNSRecord
 
 	// DMARCRecord is the DMARC policy TXT record at _dmarc.<domain>.
+	//
+	// At identity-creation time this is an OBSERVE-ONLY policy (p=none): DKIM is
+	// still PENDING and a custom MAIL FROM may not yet be published, so an
+	// enforcing policy (p=quarantine/reject) would silently quarantine all of the
+	// tenant's mail during the up-to-72h verification window. Once
+	// GetDomainVerificationStatus reports SUCCESS, upgrade the published record to
+	// the value returned by EnforcingDMARCRecord(domain).
 	DMARCRecord DNSRecord
+
+	// MailFromDomain is the custom MAIL FROM subdomain configured on the identity
+	// (mail.<domain>). It makes the SPF-checked Return-Path align to the tenant's
+	// own domain instead of amazonses.com, which strict-SPF DMARC alignment
+	// (aspf=s) requires. Empty if the MAIL FROM attribute could not be set.
+	MailFromDomain string
 
 	// CustomMAILFROMRecords enables a custom MAIL FROM subdomain (mail.<domain>)
 	// for cleaner bounce attribution. Contains an MX record and an SPF TXT record.
@@ -86,8 +99,22 @@ type IdentityManager struct {
 	cachedCount int
 	cacheExpiry time.Time
 
+	// verification-status cache: domain -> verified (DKIM == SUCCESS). Used by the
+	// optional send-gate so it does not call GetEmailIdentity on every send.
+	verifiedCache map[string]verifyCacheEntry
+
 	logger *slog.Logger
 }
+
+// verifyCacheEntry caches a domain's verification result for verifyCacheTTL.
+type verifyCacheEntry struct {
+	verified bool
+	expiry   time.Time
+}
+
+// verifyCacheTTL is how long a verification result is trusted before re-checking.
+// Short, so a newly-verified domain becomes sendable quickly.
+const verifyCacheTTL = 60 * time.Second
 
 // NewIdentityManager returns an IdentityManager for the given SES region.
 // warnThreshold defaults to DefaultWarnThreshold when <= 0.
@@ -102,6 +129,7 @@ func NewIdentityManager(client SESEmailClient, region string, warnThreshold int,
 		client:        client,
 		region:        region,
 		warnThreshold: warnThreshold,
+		verifiedCache: make(map[string]verifyCacheEntry),
 		logger:        logger,
 	}
 }
@@ -240,17 +268,19 @@ func (m *IdentityManager) CreateDomainIdentity(ctx context.Context, domain strin
 		TTL:   300,
 	}
 
-	// DMARC — quarantine policy with aggregate reporting.
-	result.DMARCRecord = DNSRecord{
-		Type:  "TXT",
-		Name:  fmt.Sprintf("_dmarc.%s", domain),
-		Value: fmt.Sprintf(`"v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@%s; adkim=s; aspf=s"`, domain),
-		TTL:   300,
-	}
+	// DMARC — OBSERVE-ONLY (p=none) at creation time.
+	//
+	// Publishing an enforcing policy (p=quarantine/reject) here would silently
+	// quarantine every message the tenant sends until DKIM verifies and the
+	// custom MAIL FROM propagates (up to 72h), poisoning early deliverability.
+	// We publish p=none so mail flows and DMARC aggregate reports start arriving;
+	// the operator upgrades to EnforcingDMARCRecord(domain) once
+	// GetDomainVerificationStatus == "SUCCESS".
+	result.DMARCRecord = ObserveDMARCRecord(domain)
 
-	// Custom MAIL FROM subdomain — mail.<domain> — so that bounces are
-	// attributable to this domain rather than amazonses.com. Optional but
-	// recommended for DMARC alignment.
+	// Custom MAIL FROM subdomain — mail.<domain> — so the SPF-checked Return-Path
+	// aligns to the tenant's own domain instead of amazonses.com. Without this,
+	// strict-SPF DMARC alignment (aspf=s) can never pass.
 	mailFromDomain := fmt.Sprintf("mail.%s", domain)
 	result.CustomMAILFROMRecords = []DNSRecord{
 		{
@@ -267,7 +297,55 @@ func (m *IdentityManager) CreateDomainIdentity(ctx context.Context, domain strin
 		},
 	}
 
+	// Actually configure the custom MAIL FROM on the SES identity. Returning the
+	// DNS records is not enough — SES will not use the custom MAIL FROM unless the
+	// identity attribute is set. BehaviorOnMxFailure=UseDefaultValue means SES
+	// transparently falls back to amazonses.com while the tenant's MX/SPF records
+	// are still propagating, so this never blocks sending; once the records
+	// resolve, SPF aligns automatically.
+	if _, err := m.client.PutEmailIdentityMailFromAttributes(ctx, &sesv2.PutEmailIdentityMailFromAttributesInput{
+		EmailIdentity:       aws.String(domain),
+		MailFromDomain:      aws.String(mailFromDomain),
+		BehaviorOnMxFailure: types.BehaviorOnMxFailureUseDefaultValue,
+	}); err != nil {
+		// Non-fatal: the identity exists and mail can still flow (SPF aligns to
+		// amazonses.com only). Surface loudly so the operator can retry — without
+		// the custom MAIL FROM, strict-SPF DMARC alignment will never pass.
+		m.logger.Error("ses/identity: failed to set custom MAIL FROM — strict-SPF DMARC alignment will not pass until this succeeds",
+			"domain", domain,
+			"mailFromDomain", mailFromDomain,
+			"err", err,
+		)
+	} else {
+		result.MailFromDomain = mailFromDomain
+	}
+
 	return result, nil
+}
+
+// ObserveDMARCRecord returns the OBSERVE-ONLY (p=none) DMARC record published at
+// identity-creation time. It enforces nothing but enables aggregate reporting so
+// the operator can confirm alignment before tightening the policy.
+func ObserveDMARCRecord(domain string) DNSRecord {
+	return DNSRecord{
+		Type:  "TXT",
+		Name:  fmt.Sprintf("_dmarc.%s", domain),
+		Value: fmt.Sprintf(`"v=DMARC1; p=none; rua=mailto:dmarc-reports@%s; adkim=s; aspf=s"`, domain),
+		TTL:   300,
+	}
+}
+
+// EnforcingDMARCRecord returns the enforcing (p=quarantine) DMARC record the
+// operator should publish ONLY AFTER GetDomainVerificationStatus reports
+// "SUCCESS" and the custom MAIL FROM has propagated. Publishing it earlier
+// quarantines the tenant's legitimate mail during the verification window.
+func EnforcingDMARCRecord(domain string) DNSRecord {
+	return DNSRecord{
+		Type:  "TXT",
+		Name:  fmt.Sprintf("_dmarc.%s", domain),
+		Value: fmt.Sprintf(`"v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@%s; adkim=s; aspf=s"`, domain),
+		TTL:   300,
+	}
 }
 
 // GetDomainVerificationStatus returns the DKIM verification status for a domain.
@@ -283,6 +361,30 @@ func (m *IdentityManager) GetDomainVerificationStatus(ctx context.Context, domai
 		return string(out.DkimAttributes.Status), nil
 	}
 	return "UNKNOWN", nil
+}
+
+// IsVerified reports whether the domain's DKIM verification status is "SUCCESS",
+// i.e. it is safe to send from. Results are cached for verifyCacheTTL so this can
+// be called on the hot send path. It fails CLOSED: any API error is surfaced and
+// the domain is treated as not verified by callers.
+func (m *IdentityManager) IsVerified(ctx context.Context, domain string) (bool, error) {
+	m.mu.Lock()
+	if e, ok := m.verifiedCache[domain]; ok && time.Now().Before(e.expiry) {
+		m.mu.Unlock()
+		return e.verified, nil
+	}
+	m.mu.Unlock()
+
+	status, err := m.GetDomainVerificationStatus(ctx, domain)
+	if err != nil {
+		return false, err
+	}
+	verified := status == "SUCCESS"
+
+	m.mu.Lock()
+	m.verifiedCache[domain] = verifyCacheEntry{verified: verified, expiry: time.Now().Add(verifyCacheTTL)}
+	m.mu.Unlock()
+	return verified, nil
 }
 
 // DeleteDomainIdentity removes a domain identity from SES (e.g. when a tenant

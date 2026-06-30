@@ -15,6 +15,7 @@ type mockSESClient struct {
 	SendEmailFn           func(ctx context.Context, in *sesv2.SendEmailInput, opts ...func(*sesv2.Options)) (*sesv2.SendEmailOutput, error)
 	CreateEmailIdentityFn func(ctx context.Context, in *sesv2.CreateEmailIdentityInput, opts ...func(*sesv2.Options)) (*sesv2.CreateEmailIdentityOutput, error)
 	GetEmailIdentityFn    func(ctx context.Context, in *sesv2.GetEmailIdentityInput, opts ...func(*sesv2.Options)) (*sesv2.GetEmailIdentityOutput, error)
+	PutMailFromFn         func(ctx context.Context, in *sesv2.PutEmailIdentityMailFromAttributesInput, opts ...func(*sesv2.Options)) (*sesv2.PutEmailIdentityMailFromAttributesOutput, error)
 	ListEmailIdentitiesFn func(ctx context.Context, in *sesv2.ListEmailIdentitiesInput, opts ...func(*sesv2.Options)) (*sesv2.ListEmailIdentitiesOutput, error)
 	DeleteEmailIdentityFn func(ctx context.Context, in *sesv2.DeleteEmailIdentityInput, opts ...func(*sesv2.Options)) (*sesv2.DeleteEmailIdentityOutput, error)
 	GetAccountFn          func(ctx context.Context, in *sesv2.GetAccountInput, opts ...func(*sesv2.Options)) (*sesv2.GetAccountOutput, error)
@@ -50,6 +51,13 @@ func (m *mockSESClient) GetEmailIdentity(ctx context.Context, in *sesv2.GetEmail
 			Status: types.DkimStatusSuccess,
 		},
 	}, nil
+}
+
+func (m *mockSESClient) PutEmailIdentityMailFromAttributes(ctx context.Context, in *sesv2.PutEmailIdentityMailFromAttributesInput, opts ...func(*sesv2.Options)) (*sesv2.PutEmailIdentityMailFromAttributesOutput, error) {
+	if m.PutMailFromFn != nil {
+		return m.PutMailFromFn(ctx, in, opts...)
+	}
+	return &sesv2.PutEmailIdentityMailFromAttributesOutput{}, nil
 }
 
 func (m *mockSESClient) ListEmailIdentities(ctx context.Context, in *sesv2.ListEmailIdentitiesInput, opts ...func(*sesv2.Options)) (*sesv2.ListEmailIdentitiesOutput, error) {

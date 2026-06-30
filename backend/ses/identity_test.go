@@ -3,6 +3,7 @@ package ses
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/sesv2"
@@ -112,6 +113,75 @@ func TestCreateDomainIdentity_OK(t *testing.T) {
 	}
 	if len(result.CustomMAILFROMRecords) != 2 {
 		t.Errorf("CustomMAILFROMRecords count = %d, want 2", len(result.CustomMAILFROMRecords))
+	}
+}
+
+func TestCreateDomainIdentity_DMARCObserveOnly(t *testing.T) {
+	mc := &mockSESClient{}
+	mgr := newTestIdentityManager(mc)
+
+	result, err := mgr.CreateDomainIdentity(context.Background(), "acme.com")
+	if err != nil {
+		t.Fatalf("CreateDomainIdentity: %v", err)
+	}
+	// At creation, DKIM is PENDING — the published DMARC policy must NOT enforce,
+	// or all of the tenant's mail is quarantined during the verification window.
+	if !strings.Contains(result.DMARCRecord.Value, "p=none") {
+		t.Errorf("DMARC at creation = %q, want p=none (observe-only)", result.DMARCRecord.Value)
+	}
+	if strings.Contains(result.DMARCRecord.Value, "p=quarantine") || strings.Contains(result.DMARCRecord.Value, "p=reject") {
+		t.Errorf("DMARC at creation must not enforce, got %q", result.DMARCRecord.Value)
+	}
+	// The enforcing upgrade record is available separately for post-verification.
+	if !strings.Contains(EnforcingDMARCRecord("acme.com").Value, "p=quarantine") {
+		t.Error("EnforcingDMARCRecord should be p=quarantine")
+	}
+}
+
+func TestCreateDomainIdentity_SetsCustomMailFrom(t *testing.T) {
+	var gotMailFrom string
+	mc := &mockSESClient{
+		PutMailFromFn: func(_ context.Context, in *sesv2.PutEmailIdentityMailFromAttributesInput, _ ...func(*sesv2.Options)) (*sesv2.PutEmailIdentityMailFromAttributesOutput, error) {
+			if in.MailFromDomain != nil {
+				gotMailFrom = *in.MailFromDomain
+			}
+			return &sesv2.PutEmailIdentityMailFromAttributesOutput{}, nil
+		},
+	}
+	mgr := newTestIdentityManager(mc)
+
+	result, err := mgr.CreateDomainIdentity(context.Background(), "acme.com")
+	if err != nil {
+		t.Fatalf("CreateDomainIdentity: %v", err)
+	}
+	if gotMailFrom != "mail.acme.com" {
+		t.Errorf("MAIL FROM set to %q, want mail.acme.com", gotMailFrom)
+	}
+	if result.MailFromDomain != "mail.acme.com" {
+		t.Errorf("result.MailFromDomain = %q, want mail.acme.com", result.MailFromDomain)
+	}
+}
+
+func TestIsVerified(t *testing.T) {
+	calls := 0
+	mc := &mockSESClient{
+		GetEmailIdentityFn: func(_ context.Context, _ *sesv2.GetEmailIdentityInput, _ ...func(*sesv2.Options)) (*sesv2.GetEmailIdentityOutput, error) {
+			calls++
+			return &sesv2.GetEmailIdentityOutput{
+				DkimAttributes: &types.DkimAttributes{Status: types.DkimStatusSuccess},
+			}, nil
+		},
+	}
+	mgr := newTestIdentityManager(mc)
+
+	ok, err := mgr.IsVerified(context.Background(), "acme.com")
+	if err != nil || !ok {
+		t.Fatalf("IsVerified = %v, %v; want true, nil", ok, err)
+	}
+	// Second call within TTL should be cached (no extra API call).
+	_, _ = mgr.IsVerified(context.Background(), "acme.com")
+	if calls != 1 {
+		t.Errorf("GetEmailIdentity called %d times, want 1 (cached)", calls)
 	}
 }
 
